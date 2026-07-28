@@ -68,6 +68,15 @@ type MCPServerConfig struct {
 	// This is used for PAT scope filtering where we can't issue scope challenges.
 	TokenScopes []string
 
+	// TokenProvider, when non-nil, supplies the GitHub token for each API
+	// request instead of the static Token.
+	TokenProvider func() string
+
+	// ToolHandlerMiddleware wraps every registered tool handler. Unlike MCP
+	// receiving middleware, these wrappers execute inside Server.callTool, so
+	// SDK result finalization still runs on results they return.
+	ToolHandlerMiddleware []inventory.ToolHandlerMiddleware
+
 	// Additional server options to apply
 	ServerOptions []MCPServerOption
 }
@@ -100,7 +109,7 @@ func NewMCPServer(ctx context.Context, cfg *MCPServerConfig, deps ToolDependenci
 	}
 
 	// Register GitHub tools/resources/prompts from the inventory.
-	inv.RegisterAll(ctx, ghServer, deps)
+	inv.RegisterAll(ctx, ghServer, deps, cfg.ToolHandlerMiddleware...)
 
 	// Register MCP App UI resources whenever the embedded UI assets are
 	// available. The resources are static HTML and are only referenced by
@@ -111,7 +120,7 @@ func NewMCPServer(ctx context.Context, cfg *MCPServerConfig, deps ToolDependenci
 	// remote/HTTP server also serves them, fixing the "-32002 Resource not
 	// found" error clients hit after the tool returns a ui:// URI.
 	if UIAssetsAvailable() {
-		RegisterUIResources(ghServer)
+		RegisterUIResources(ghServer, cfg.ReadOnly)
 	}
 
 	return ghServer, nil

@@ -7,16 +7,21 @@ import (
 	"maps"
 	"strings"
 
+	ghcontext "github.com/github/github-mcp-server/pkg/context"
 	ghErrors "github.com/github/github-mcp-server/pkg/errors"
 	"github.com/github/github-mcp-server/pkg/inventory"
 	"github.com/github/github-mcp-server/pkg/scopes"
 	"github.com/github/github-mcp-server/pkg/translations"
 	"github.com/github/github-mcp-server/pkg/utils"
-	"github.com/google/go-github/v87/github"
+	"github.com/google/go-github/v89/github"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/shurcooL/githubv4"
 )
+
+func normalizeConfidence(confidence string) string {
+	return strings.ToUpper(strings.TrimSpace(confidence))
+}
 
 // issueUpdateTool is a helper to create single-field issue update tools.
 func issueUpdateTool(
@@ -233,44 +238,220 @@ func GranularUpdateIssueBody(t translations.TranslationHelperFunc) inventory.Ser
 
 // GranularUpdateIssueAssignees creates a tool to update an issue's assignees.
 func GranularUpdateIssueAssignees(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return issueUpdateTool(t,
-		"update_issue_assignees",
-		"Update the assignees of an existing issue. This replaces the current assignees with the provided list.",
-		"Update Issue Assignees",
-		map[string]*jsonschema.Schema{
-			"assignees": {
-				Type:        "array",
-				Description: "GitHub usernames to assign to this issue",
-				Items:       &jsonschema.Schema{Type: "string"},
+	st := NewTool(
+		ToolsetMetadataIssues,
+		mcp.Tool{
+			Name:        "update_issue_assignees",
+			Description: t("TOOL_UPDATE_ISSUE_ASSIGNEES_DESCRIPTION", "Update the assignees of an existing issue. This replaces the current assignees with the provided list. When setting values, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the choice."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_UPDATE_ISSUE_ASSIGNEES_USER_TITLE", "Update Issue Assignees"),
+				ReadOnlyHint:    false,
+				DestructiveHint: jsonschema.Ptr(false),
+				OpenWorldHint:   jsonschema.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"issue_number": {
+						Type:        "number",
+						Description: "The issue number to update",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+					"assignees": {
+						Type:        "array",
+						Description: "GitHub usernames to assign to this issue.",
+						Items: &jsonschema.Schema{
+							OneOf: []*jsonschema.Schema{
+								{Type: "string", Description: "GitHub username"},
+								{
+									Type: "object",
+									Properties: map[string]*jsonschema.Schema{
+										"login": {
+											Type:        "string",
+											Description: "GitHub username",
+										},
+										"rationale": {
+											Type: "string",
+											Description: "One concise sentence explaining what specifically about the issue led you to choose this assignee. " +
+												"State the concrete signal (e.g. 'Authored the file the crash originates in').",
+											MaxLength: jsonschema.Ptr(280),
+										},
+										"confidence": {
+											Type:        "string",
+											Description: "How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal.",
+											Enum:        []any{"LOW", "MEDIUM", "HIGH"},
+										},
+										"is_suggestion": {
+											Type: "boolean",
+											Description: "If true, this assignee is sent to the API as a suggestion (suggest:true) rather than an applied assignee. " +
+												"Whether the assignee is applied or recorded as a proposal is determined by the API.",
+										},
+									},
+									Required: []string{"login"},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"owner", "repo", "issue_number", "assignees"},
 			},
 		},
-		[]string{"assignees"},
-		func(args map[string]any) (*github.IssueRequest, error) {
-			if _, ok := args["assignees"]; !ok {
-				return nil, fmt.Errorf("missing required parameter: assignees")
-			}
-			assignees, err := OptionalStringArrayParam(args, "assignees")
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
 			if err != nil {
-				return nil, err
+				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			return &github.IssueRequest{Assignees: &assignees}, nil
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			issueNumber, err := RequiredInt(args, "issue_number")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			assigneesRaw, ok := args["assignees"]
+			if !ok {
+				return utils.NewToolResultError("missing required parameter: assignees"), nil, nil
+			}
+			assigneesSlice, ok := assigneesRaw.([]any)
+			if !ok {
+				// Also accept []string for callers that pre-typed the array.
+				if strs, ok := assigneesRaw.([]string); ok {
+					assigneesSlice = make([]any, len(strs))
+					for i, s := range strs {
+						assigneesSlice[i] = s
+					}
+				} else {
+					return utils.NewToolResultError("parameter assignees must be an array"), nil, nil
+				}
+			}
+
+			useObjectForm := false
+			payload := make([]any, 0, len(assigneesSlice))
+			for _, item := range assigneesSlice {
+				switch v := item.(type) {
+				case string:
+					payload = append(payload, v)
+				case map[string]any:
+					login, err := RequiredParam[string](v, "login")
+					if err != nil {
+						return utils.NewToolResultError("each assignee object must have a 'login' string"), nil, nil
+					}
+					rationale, err := OptionalParam[string](v, "rationale")
+					if err != nil {
+						return utils.NewToolResultError(err.Error()), nil, nil
+					}
+					rationale = strings.TrimSpace(rationale)
+					if len([]rune(rationale)) > 280 {
+						return utils.NewToolResultError("assignee rationale must be 280 characters or less"), nil, nil
+					}
+					confidence, err := OptionalParam[string](v, "confidence")
+					if err != nil {
+						return utils.NewToolResultError(err.Error()), nil, nil
+					}
+					confidence = normalizeConfidence(confidence)
+					if confidence != "" && confidence != "LOW" && confidence != "MEDIUM" && confidence != "HIGH" {
+						return utils.NewToolResultError("confidence must be one of: LOW, MEDIUM, HIGH"), nil, nil
+					}
+					isSuggestion, err := OptionalParam[bool](v, "is_suggestion")
+					if err != nil {
+						return utils.NewToolResultError(err.Error()), nil, nil
+					}
+					if rationale == "" && !isSuggestion && confidence == "" {
+						payload = append(payload, login)
+					} else {
+						useObjectForm = true
+						payload = append(payload, assigneeWithIntent{Login: login, Rationale: rationale, Confidence: confidence, Suggest: isSuggestion})
+					}
+				default:
+					return utils.NewToolResultError("each assignee must be a string or an object with 'login' and optional 'rationale', 'confidence', and/or 'is_suggestion'"), nil, nil
+				}
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
+			}
+
+			var body any
+			if useObjectForm {
+				body = &assigneesUpdateRequest{Assignees: payload}
+			} else {
+				// Preserve the standard wire format when no rationale or suggest is supplied.
+				logins := make([]string, len(payload))
+				for i, p := range payload {
+					logins[i] = p.(string)
+				}
+				body = &github.IssueRequest{Assignees: &logins}
+			}
+
+			apiURL := fmt.Sprintf("repos/%s/%s/issues/%d", owner, repo, issueNumber)
+			req, err := client.NewRequest(ctx, "PATCH", apiURL, body)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to create request", err), nil, nil
+			}
+
+			issue := &github.Issue{}
+			resp, err := client.Do(req, issue)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to update issue", resp, err), nil, nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			r, err := json.Marshal(MinimalResponse{
+				ID:  fmt.Sprintf("%d", issue.GetID()),
+				URL: issue.GetHTMLURL(),
+			})
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
+			}
+			return utils.NewToolResultText(string(r)), nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagIssuesGranular
+	return st
 }
 
-// labelWithRationale represents the object form of a label entry, allowing a
-// rationale and/or suggest flag to be sent alongside the label name.
-type labelWithRationale struct {
-	Name      string `json:"name"`
-	Rationale string `json:"rationale,omitempty"`
-	Suggest   bool   `json:"suggest,omitempty"`
+// labelWithIntent represents the object form of a label entry, allowing a
+// rationale, confidence level, and/or suggest flag to be sent alongside the label name.
+type labelWithIntent struct {
+	Name       string `json:"name"`
+	Rationale  string `json:"rationale,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	Suggest    bool   `json:"suggest,omitempty"`
 }
 
 // labelsUpdateRequest is a custom request body for updating an issue's labels
 // where individual labels may optionally include a rationale. Each element of
-// Labels is either a string (label name) or a labelWithRationale object.
+// Labels is either a string (label name) or a labelWithIntent object.
 type labelsUpdateRequest struct {
 	Labels []any `json:"labels"`
+}
+
+// assigneeWithIntent represents the object form of an assignee entry, allowing a
+// rationale, confidence level, and/or suggest flag to be sent alongside the login.
+type assigneeWithIntent struct {
+	Login      string `json:"login"`
+	Rationale  string `json:"rationale,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	Suggest    bool   `json:"suggest,omitempty"`
+}
+
+// assigneesUpdateRequest is a custom request body for updating an issue's
+// assignees where individual assignees may optionally include a rationale. Each
+// element of Assignees is either a string (login) or an assigneeWithIntent object.
+type assigneesUpdateRequest struct {
+	Assignees []any `json:"assignees"`
 }
 
 // GranularUpdateIssueLabels creates a tool to update an issue's labels.
@@ -279,7 +460,7 @@ func GranularUpdateIssueLabels(t translations.TranslationHelperFunc) inventory.S
 		ToolsetMetadataIssues,
 		mcp.Tool{
 			Name:        "update_issue_labels",
-			Description: t("TOOL_UPDATE_ISSUE_LABELS_DESCRIPTION", "Update the labels of an existing issue. This replaces the current labels with the provided list."),
+			Description: t("TOOL_UPDATE_ISSUE_LABELS_DESCRIPTION", "Update the labels of an existing issue. This replaces the current labels with the provided list. When setting values, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the choice."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:           t("TOOL_UPDATE_ISSUE_LABELS_USER_TITLE", "Update Issue Labels"),
 				ReadOnlyHint:    false,
@@ -320,6 +501,11 @@ func GranularUpdateIssueLabels(t translations.TranslationHelperFunc) inventory.S
 											Description: "One concise sentence explaining what specifically about the issue led you to choose this label. " +
 												"State the concrete signal (e.g. 'Reports a crash when saving' → bug).",
 											MaxLength: jsonschema.Ptr(280),
+										},
+										"confidence": {
+											Type:        "string",
+											Description: "How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal.",
+											Enum:        []any{"LOW", "MEDIUM", "HIGH"},
 										},
 										"is_suggestion": {
 											Type: "boolean",
@@ -387,18 +573,26 @@ func GranularUpdateIssueLabels(t translations.TranslationHelperFunc) inventory.S
 					if len([]rune(rationale)) > 280 {
 						return utils.NewToolResultError("label rationale must be 280 characters or less"), nil, nil
 					}
+					confidence, err := OptionalParam[string](v, "confidence")
+					if err != nil {
+						return utils.NewToolResultError(err.Error()), nil, nil
+					}
+					confidence = normalizeConfidence(confidence)
+					if confidence != "" && confidence != "LOW" && confidence != "MEDIUM" && confidence != "HIGH" {
+						return utils.NewToolResultError("confidence must be one of: LOW, MEDIUM, HIGH"), nil, nil
+					}
 					isSuggestion, err := OptionalParam[bool](v, "is_suggestion")
 					if err != nil {
 						return utils.NewToolResultError(err.Error()), nil, nil
 					}
-					if rationale == "" && !isSuggestion {
+					if rationale == "" && !isSuggestion && confidence == "" {
 						payload = append(payload, name)
 					} else {
 						useObjectForm = true
-						payload = append(payload, labelWithRationale{Name: name, Rationale: rationale, Suggest: isSuggestion})
+						payload = append(payload, labelWithIntent{Name: name, Rationale: rationale, Confidence: confidence, Suggest: isSuggestion})
 					}
 				default:
-					return utils.NewToolResultError("each label must be a string or an object with 'name' and optional 'rationale' and/or 'is_suggestion'"), nil, nil
+					return utils.NewToolResultError("each label must be a string or an object with 'name' and optional 'rationale', 'confidence', and/or 'is_suggestion'"), nil, nil
 				}
 			}
 
@@ -470,18 +664,19 @@ func GranularUpdateIssueMilestone(t translations.TranslationHelperFunc) inventor
 	)
 }
 
-// issueTypeWithRationale represents the object form of the issue type field,
-// allowing a rationale and/or suggest flag to be sent alongside the type name.
-type issueTypeWithRationale struct {
-	Value     string `json:"value"`
-	Rationale string `json:"rationale,omitempty"`
-	Suggest   bool   `json:"suggest,omitempty"`
+// issueTypeWithIntent represents the object form of the issue type field,
+// allowing a rationale, confidence level, and/or suggest flag to be sent alongside the type name.
+type issueTypeWithIntent struct {
+	Value      string `json:"value"`
+	Rationale  string `json:"rationale,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	Suggest    bool   `json:"suggest,omitempty"`
 }
 
 // issueTypeUpdateRequest is a custom request body for updating an issue type
-// with an optional rationale, using the object form that the REST API accepts.
+// with optional intent metadata, using the object form that the REST API accepts.
 type issueTypeUpdateRequest struct {
-	Type issueTypeWithRationale `json:"type"`
+	Type issueTypeWithIntent `json:"type"`
 }
 
 // GranularUpdateIssueType creates a tool to update an issue's type.
@@ -490,7 +685,7 @@ func GranularUpdateIssueType(t translations.TranslationHelperFunc) inventory.Ser
 		ToolsetMetadataIssues,
 		mcp.Tool{
 			Name:        "update_issue_type",
-			Description: t("TOOL_UPDATE_ISSUE_TYPE_DESCRIPTION", "Update the type of an existing issue (e.g. 'bug', 'feature')."),
+			Description: t("TOOL_UPDATE_ISSUE_TYPE_DESCRIPTION", "Update the type of an existing issue (e.g. 'bug', 'feature'). When setting values, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the choice."),
 			Annotations: &mcp.ToolAnnotations{
 				Title:           t("TOOL_UPDATE_ISSUE_TYPE_USER_TITLE", "Update Issue Type"),
 				ReadOnlyHint:    false,
@@ -522,6 +717,11 @@ func GranularUpdateIssueType(t translations.TranslationHelperFunc) inventory.Ser
 						Description: "One concise sentence explaining what specifically about the issue led you to choose this type. " +
 							"State the concrete signal (e.g. 'Reports a crash when saving' → bug, 'Asks for dark mode support' → feature).",
 						MaxLength: jsonschema.Ptr(280),
+					},
+					"confidence": {
+						Type:        "string",
+						Description: "How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal.",
+						Enum:        []any{"LOW", "MEDIUM", "HIGH"},
 					},
 					"is_suggestion": {
 						Type: "boolean",
@@ -558,6 +758,14 @@ func GranularUpdateIssueType(t translations.TranslationHelperFunc) inventory.Ser
 			if len([]rune(rationale)) > 280 {
 				return utils.NewToolResultError("parameter rationale must be 280 characters or less"), nil, nil
 			}
+			confidence, err := OptionalParam[string](args, "confidence")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			confidence = normalizeConfidence(confidence)
+			if confidence != "" && confidence != "LOW" && confidence != "MEDIUM" && confidence != "HIGH" {
+				return utils.NewToolResultError("confidence must be one of: LOW, MEDIUM, HIGH"), nil, nil
+			}
 			isSuggestion, err := OptionalParam[bool](args, "is_suggestion")
 			if err != nil {
 				return utils.NewToolResultError(err.Error()), nil, nil
@@ -569,12 +777,13 @@ func GranularUpdateIssueType(t translations.TranslationHelperFunc) inventory.Ser
 			}
 
 			var body any
-			if rationale != "" || isSuggestion {
+			if rationale != "" || isSuggestion || confidence != "" {
 				body = &issueTypeUpdateRequest{
-					Type: issueTypeWithRationale{
-						Value:     issueType,
-						Rationale: rationale,
-						Suggest:   isSuggestion,
+					Type: issueTypeWithIntent{
+						Value:      issueType,
+						Rationale:  rationale,
+						Confidence: confidence,
+						Suggest:    isSuggestion,
 					},
 				}
 			} else {
@@ -608,39 +817,202 @@ func GranularUpdateIssueType(t translations.TranslationHelperFunc) inventory.Ser
 	return st
 }
 
+// stateWithIntent represents the object form of the state field, allowing
+// rationale, confidence, and/or suggest flag to be sent alongside the state value.
+type stateWithIntent struct {
+	Value      string `json:"value"`
+	Rationale  string `json:"rationale,omitempty"`
+	Confidence string `json:"confidence,omitempty"`
+	Suggest    bool   `json:"suggest,omitempty"`
+}
+
+// stateUpdateRequest is a custom request body for updating an issue's state
+// with optional intent metadata, using the object form that the REST API accepts.
+type stateUpdateRequest struct {
+	State            stateWithIntent `json:"state"`
+	StateReason      string          `json:"state_reason,omitempty"`
+	DuplicateIssueID *int64          `json:"duplicate_issue_id,omitempty"`
+}
+
 // GranularUpdateIssueState creates a tool to update an issue's state.
 func GranularUpdateIssueState(t translations.TranslationHelperFunc) inventory.ServerTool {
-	return issueUpdateTool(t,
-		"update_issue_state",
-		"Update the state of an existing issue (open or closed), with an optional state reason.",
-		"Update Issue State",
-		map[string]*jsonschema.Schema{
-			"state": {
-				Type:        "string",
-				Description: "The new state for the issue",
-				Enum:        []any{"open", "closed"},
+	st := NewTool(
+		ToolsetMetadataIssues,
+		mcp.Tool{
+			Name:        "update_issue_state",
+			Description: t("TOOL_UPDATE_ISSUE_STATE_DESCRIPTION", "Update the state of an existing issue (open or closed), with an optional state reason. When closing, include a confidence level (LOW, MEDIUM, or HIGH) reflecting how certain you are about the decision. Use is_suggestion to propose the change without applying it directly."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_UPDATE_ISSUE_STATE_USER_TITLE", "Update Issue State"),
+				ReadOnlyHint:    false,
+				DestructiveHint: jsonschema.Ptr(false),
+				OpenWorldHint:   jsonschema.Ptr(true),
 			},
-			"state_reason": {
-				Type:        "string",
-				Description: "The reason for the state change (only for closed state)",
-				Enum:        []any{"completed", "not_planned", "duplicate"},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"issue_number": {
+						Type:        "number",
+						Description: "The issue number to update",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+					"state": {
+						Type:        "string",
+						Description: "The new state for the issue",
+						Enum:        []any{"open", "closed"},
+					},
+					"state_reason": {
+						Type:        "string",
+						Description: "The reason for the state change (only for closed state)",
+						Enum:        []any{"completed", "not_planned", "duplicate"},
+					},
+					"rationale": {
+						Type: "string",
+						Description: "One concise sentence explaining what specifically about the issue led you to choose this state. " +
+							"State the concrete signal (e.g. 'The reported crash is fixed in v2.1' → completed).",
+						MaxLength: jsonschema.Ptr(280),
+					},
+					"confidence": {
+						Type:        "string",
+						Description: "How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal.",
+						Enum:        []any{"LOW", "MEDIUM", "HIGH"},
+					},
+					"is_suggestion": {
+						Type: "boolean",
+						Description: "If true, this state change is sent to the API as a suggestion (suggest:true) rather than an applied change. " +
+							"Whether the change is applied or recorded as a proposal is determined by the API.",
+					},
+					"duplicate_of": {
+						Type:        "number",
+						Description: "The issue number of the canonical issue this issue duplicates. Only valid when state_reason is 'duplicate'. Required when is_suggestion is true and state_reason is 'duplicate'. The issue number is resolved to a database ID before being sent to the API.",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+				},
+				Required: []string{"owner", "repo", "issue_number", "state"},
 			},
 		},
-		[]string{"state"},
-		func(args map[string]any) (*github.IssueRequest, error) {
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			issueNumber, err := RequiredInt(args, "issue_number")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
 			state, err := RequiredParam[string](args, "state")
 			if err != nil {
-				return nil, err
+				return utils.NewToolResultError(err.Error()), nil, nil
 			}
-			req := &github.IssueRequest{State: &state}
+			stateReason, err := OptionalParam[string](args, "state_reason")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			rationale, err := OptionalParam[string](args, "rationale")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			rationale = strings.TrimSpace(rationale)
+			if len([]rune(rationale)) > 280 {
+				return utils.NewToolResultError("parameter rationale must be 280 characters or less"), nil, nil
+			}
+			confidence, err := OptionalParam[string](args, "confidence")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			confidence = normalizeConfidence(confidence)
+			if confidence != "" && confidence != "LOW" && confidence != "MEDIUM" && confidence != "HIGH" {
+				return utils.NewToolResultError("confidence must be one of: LOW, MEDIUM, HIGH"), nil, nil
+			}
+			isSuggestion, err := OptionalParam[bool](args, "is_suggestion")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			duplicateOf, err := OptionalIntParam(args, "duplicate_of")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			if stateReason != "" && state != "closed" {
+				return utils.NewToolResultError("state_reason can only be used when state is 'closed'"), nil, nil
+			}
+			if duplicateOf != 0 && stateReason != "duplicate" {
+				return utils.NewToolResultError("duplicate_of can only be used when state_reason is 'duplicate'"), nil, nil
+			}
+			if isSuggestion && stateReason == "duplicate" && duplicateOf == 0 {
+				return utils.NewToolResultError("duplicate_of is required when suggesting a close as duplicate"), nil, nil
+			}
 
-			stateReason, _ := OptionalParam[string](args, "state_reason")
-			if stateReason != "" {
-				req.StateReason = &stateReason
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
 			}
-			return req, nil
+
+			var body any
+			if rationale != "" || isSuggestion || confidence != "" || duplicateOf != 0 {
+				req := &stateUpdateRequest{
+					State: stateWithIntent{
+						Value:      state,
+						Rationale:  rationale,
+						Confidence: confidence,
+						Suggest:    isSuggestion,
+					},
+					StateReason: stateReason,
+				}
+				if duplicateOf != 0 {
+					duplicateIssue, resp, err := client.Issues.Get(ctx, owner, repo, duplicateOf)
+					if err != nil {
+						return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to get duplicate issue", resp, err), nil, nil
+					}
+					_ = resp.Body.Close()
+					id := duplicateIssue.GetID()
+					req.DuplicateIssueID = &id
+				}
+				body = req
+			} else {
+				req := &github.IssueRequest{State: &state}
+				if stateReason != "" {
+					req.StateReason = &stateReason
+				}
+				body = req
+			}
+
+			apiURL := fmt.Sprintf("repos/%s/%s/issues/%d", owner, repo, issueNumber)
+			req, err := client.NewRequest(ctx, "PATCH", apiURL, body)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to create request", err), nil, nil
+			}
+
+			issue := &github.Issue{}
+			resp, err := client.Do(req, issue)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to update issue", resp, err), nil, nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			r, err := json.Marshal(MinimalResponse{
+				ID:  fmt.Sprintf("%d", issue.GetID()),
+				URL: issue.GetHTMLURL(),
+			})
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
+			}
+			return utils.NewToolResultText(string(r)), nil, nil
 		},
 	)
+	st.FeatureFlagEnable = FeatureFlagIssuesGranular
+	return st
 }
 
 // GranularAddSubIssue creates a tool to add a sub-issue.
@@ -887,6 +1259,7 @@ type IssueFieldCreateOrUpdateInput struct {
 	SingleSelectOptionID *githubv4.ID      `json:"singleSelectOptionId,omitempty"`
 	Delete               *githubv4.Boolean `json:"delete,omitempty"`
 	Rationale            *githubv4.String  `json:"rationale,omitempty"`
+	Confidence           *string           `json:"confidence,omitempty"`
 	Suggest              *githubv4.Boolean `json:"suggest,omitempty"`
 }
 
@@ -955,6 +1328,11 @@ func GranularSetIssueFields(t translations.TranslationHelperFunc) inventory.Serv
 									Description: "One concise sentence explaining what specifically about the issue led you to choose this field value. " +
 										"State the concrete signal (e.g. 'Reports a crash when saving' → high priority).",
 									MaxLength: jsonschema.Ptr(280),
+								},
+								"confidence": {
+									Type:        "string",
+									Description: "How confident you are in this choice. Use 'HIGH' for clear signal or explicit user request, 'MEDIUM' for reasonable inference with some ambiguity, 'LOW' for best guess with limited signal.",
+									Enum:        []any{"LOW", "MEDIUM", "HIGH"},
 								},
 								"is_suggestion": {
 									Type: "boolean",
@@ -1073,6 +1451,18 @@ func GranularSetIssueFields(t translations.TranslationHelperFunc) inventory.Serv
 					}
 				}
 
+				confidence, err := OptionalParam[string](fieldMap, "confidence")
+				if err != nil {
+					return utils.NewToolResultError(err.Error()), nil, nil
+				}
+				confidence = normalizeConfidence(confidence)
+				if confidence != "" && confidence != "LOW" && confidence != "MEDIUM" && confidence != "HIGH" {
+					return utils.NewToolResultError("confidence must be one of: LOW, MEDIUM, HIGH"), nil, nil
+				}
+				if confidence != "" {
+					input.Confidence = &confidence
+				}
+
 				isSuggestion, err := OptionalParam[bool](fieldMap, "is_suggestion")
 				if err != nil {
 					return utils.NewToolResultError(err.Error()), nil, nil
@@ -1126,13 +1516,180 @@ func GranularSetIssueFields(t translations.TranslationHelperFunc) inventory.Serv
 				IssueFields: issueFields,
 			}
 
-			if err := gqlClient.Mutate(ctx, &mutation, mutationInput, nil); err != nil {
+			// The rationale and suggest input fields on IssueFieldCreateOrUpdateInput
+			// are gated behind the update_issue_suggestions GraphQL feature flag.
+			ctxWithFeatures := ghcontext.WithGraphQLFeatures(ctx, "update_issue_suggestions")
+			if err := gqlClient.Mutate(ctxWithFeatures, &mutation, mutationInput, nil); err != nil {
 				return ghErrors.NewGitHubGraphQLErrorResponse(ctx, "failed to set issue field values", err), nil, nil
 			}
 
 			r, err := json.Marshal(MinimalResponse{
 				ID:  fmt.Sprintf("%v", mutation.SetIssueFieldValue.Issue.ID),
 				URL: string(mutation.SetIssueFieldValue.Issue.URL),
+			})
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
+			}
+			return utils.NewToolResultText(string(r)), nil, nil
+		},
+	)
+	st.FeatureFlagEnable = FeatureFlagIssuesGranular
+	return st
+}
+
+// GranularAddIssueReaction adds a reaction to an issue or pull request.
+func GranularAddIssueReaction(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := NewTool(
+		ToolsetMetadataIssues,
+		mcp.Tool{
+			Name:        "add_issue_reaction",
+			Description: t("TOOL_ADD_ISSUE_REACTION_DESCRIPTION", "Add a reaction to an issue or pull request."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_ADD_ISSUE_REACTION_USER_TITLE", "Add Reaction to Issue or Pull Request"),
+				ReadOnlyHint:    false,
+				DestructiveHint: jsonschema.Ptr(false),
+				OpenWorldHint:   jsonschema.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"issue_number": {
+						Type:        "number",
+						Description: "The issue number",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+					"content": {
+						Type:        "string",
+						Description: "The emoji reaction type",
+						Enum:        []any{"+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"},
+					},
+				},
+				Required: []string{"owner", "repo", "issue_number", "content"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			issueNumber, err := RequiredInt(args, "issue_number")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			content, err := RequiredParam[string](args, "content")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
+			}
+
+			reaction, resp, err := client.Reactions.CreateIssueReaction(ctx, owner, repo, issueNumber, content)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to add reaction to issue", resp, err), nil, nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			r, err := json.Marshal(MinimalResponse{
+				ID:  fmt.Sprintf("%d", reaction.GetID()),
+				URL: fmt.Sprintf("%srepos/%s/%s/issues/%d/reactions/%d", client.BaseURL(), owner, repo, issueNumber, reaction.GetID()),
+			})
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
+			}
+			return utils.NewToolResultText(string(r)), nil, nil
+		},
+	)
+	st.FeatureFlagEnable = FeatureFlagIssuesGranular
+	return st
+}
+
+// GranularAddIssueCommentReaction adds a reaction to an issue or pull request comment.
+func GranularAddIssueCommentReaction(t translations.TranslationHelperFunc) inventory.ServerTool {
+	st := NewTool(
+		ToolsetMetadataIssues,
+		mcp.Tool{
+			Name:        "add_issue_comment_reaction",
+			Description: t("TOOL_ADD_ISSUE_COMMENT_REACTION_DESCRIPTION", "Add a reaction to an issue or pull request comment."),
+			Annotations: &mcp.ToolAnnotations{
+				Title:           t("TOOL_ADD_ISSUE_COMMENT_REACTION_USER_TITLE", "Add Reaction to Issue or Pull Request Comment"),
+				ReadOnlyHint:    false,
+				DestructiveHint: jsonschema.Ptr(false),
+				OpenWorldHint:   jsonschema.Ptr(true),
+			},
+			InputSchema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {
+						Type:        "string",
+						Description: "Repository owner (username or organization)",
+					},
+					"repo": {
+						Type:        "string",
+						Description: "Repository name",
+					},
+					"comment_id": {
+						Type:        "number",
+						Description: "The issue or pull request comment ID",
+						Minimum:     jsonschema.Ptr(1.0),
+					},
+					"content": {
+						Type:        "string",
+						Description: "The emoji reaction type",
+						Enum:        []any{"+1", "-1", "laugh", "confused", "heart", "hooray", "rocket", "eyes"},
+					},
+				},
+				Required: []string{"owner", "repo", "comment_id", "content"},
+			},
+		},
+		[]scopes.Scope{scopes.Repo},
+		func(ctx context.Context, deps ToolDependencies, _ *mcp.CallToolRequest, args map[string]any) (*mcp.CallToolResult, any, error) {
+			owner, err := RequiredParam[string](args, "owner")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			repo, err := RequiredParam[string](args, "repo")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			commentID, err := RequiredBigInt(args, "comment_id")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+			content, err := RequiredParam[string](args, "content")
+			if err != nil {
+				return utils.NewToolResultError(err.Error()), nil, nil
+			}
+
+			client, err := deps.GetClient(ctx)
+			if err != nil {
+				return utils.NewToolResultErrorFromErr("failed to get GitHub client", err), nil, nil
+			}
+
+			reaction, resp, err := client.Reactions.CreateIssueCommentReaction(ctx, owner, repo, commentID, content)
+			if err != nil {
+				return ghErrors.NewGitHubAPIErrorResponse(ctx, "failed to add reaction to issue comment", resp, err), nil, nil
+			}
+			defer func() { _ = resp.Body.Close() }()
+
+			r, err := json.Marshal(MinimalResponse{
+				ID:  fmt.Sprintf("%d", reaction.GetID()),
+				URL: fmt.Sprintf("%srepos/%s/%s/issues/comments/%d/reactions/%d", client.BaseURL(), owner, repo, commentID, reaction.GetID()),
 			})
 			if err != nil {
 				return utils.NewToolResultErrorFromErr("failed to marshal response", err), nil, nil
